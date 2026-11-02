@@ -4,10 +4,15 @@ import (
 	"errors"
 	"hash/crc32"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/bitleak/go-redis-pool/v3/hashkit"
 	"github.com/redis/go-redis/v9"
 )
+
+// DefaultMultiKeyWorkerIdleTimeout is the default ShardConfig.MultiKeyWorkerIdleTimeout.
+const DefaultMultiKeyWorkerIdleTimeout = 10 * time.Second
 
 const (
 	// DistributeByModular selects the sharding factory by modular
@@ -24,12 +29,43 @@ type ShardConfig struct {
 	Shards         []*HAConfig
 	DistributeType int // distribution type of the shards, supports `DistributeByModular` or `DistributeByKetama`
 	HashFn         func(key []byte) uint32
+	// MultiKeyWorkers is the maximum number of long-lived goroutines that run
+	// per-shard parts of multi-key commands (MGET, DEL, ...). By default every
+	// part runs in a new goroutine. A new goroutine starts with a small stack,
+	// and a deep call chain (hooks, TLS) makes the runtime grow and copy it on
+	// every command. A worker's stack is grown once and reused.
+	//
+	// Workers are started on demand and exit after MultiKeyWorkerIdleTimeout
+	// without tasks, also after the pool is closed. When all workers are busy
+	// and the limit is reached, a one-off goroutine is started as before.
+	// Zero or a negative value disables the workers.
+	MultiKeyWorkers int
+	// MultiKeyWorkerIdleTimeout is how long an idle worker waits for a task
+	// before it exits. Defaults to DefaultMultiKeyWorkerIdleTimeout.
+	MultiKeyWorkerIdleTimeout time.Duration
 }
 
 type ShardConnFactory struct {
 	cfg    *ShardConfig
 	shards []*HAConnFactory
 	hash   hashkit.HashKit
+
+	tasks   []chan multiKeyTask // per shard
+	workers atomic.Int32
+}
+
+// multiKeyTask is a per-shard part of a multi-key command.
+type multiKeyTask struct {
+	fn      multiKeyFn
+	keys    []string
+	results []redis.Cmder
+	i       int
+	wg      *sync.WaitGroup
+}
+
+func (t *multiKeyTask) run(factory *ShardConnFactory) {
+	t.results[t.i] = t.fn(factory, t.keys...)
+	t.wg.Done()
 }
 
 func NewShardConnFactory(cfg *ShardConfig) (*ShardConnFactory, error) {
@@ -60,7 +96,71 @@ func NewShardConnFactory(cfg *ShardConfig) (*ShardConnFactory, error) {
 		}
 		factory.hash = hashkit.NewKetama(servers, factory.cfg.HashFn)
 	}
+	factory.startWorkers()
 	return factory, nil
+}
+
+func (factory *ShardConnFactory) startWorkers() {
+	if factory.cfg.MultiKeyWorkers <= 0 {
+		return
+	}
+	if factory.cfg.MultiKeyWorkerIdleTimeout <= 0 {
+		factory.cfg.MultiKeyWorkerIdleTimeout = DefaultMultiKeyWorkerIdleTimeout
+	}
+	// A channel per shard spreads contention between concurrent commands.
+	// Channels are unbuffered: a task is handed over only to an idle worker.
+	factory.tasks = make([]chan multiKeyTask, len(factory.shards))
+	for i := range factory.tasks {
+		factory.tasks[i] = make(chan multiKeyTask)
+	}
+}
+
+// runTask hands the task over to an idle worker, starts a new worker if the
+// limit allows, or falls back to a one-off goroutine.
+func (factory *ShardConnFactory) runTask(ind uint32, task multiKeyTask) {
+	if factory.tasks == nil {
+		go task.run(factory)
+		return
+	}
+	tasks := factory.tasks[ind]
+	select {
+	case tasks <- task:
+		return
+	default:
+	}
+	if factory.workers.Add(1) <= int32(factory.cfg.MultiKeyWorkers) {
+		go factory.worker(tasks, task)
+		return
+	}
+	factory.workers.Add(-1)
+	go task.run(factory)
+}
+
+func (factory *ShardConnFactory) worker(tasks chan multiKeyTask, task multiKeyTask) {
+	defer factory.workers.Add(-1)
+
+	task.run(factory)
+
+	idle := factory.cfg.MultiKeyWorkerIdleTimeout
+	timer := time.NewTimer(idle)
+	defer timer.Stop()
+	for {
+		select {
+		case task := <-tasks:
+			task.run(factory)
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			timer.Reset(idle)
+		case <-timer.C:
+			// Workers have no stop channel: a select on a channel shared by all
+			// workers would contend on its lock. After close they exit by timeout.
+			return
+		}
+	}
 }
 
 func (factory *ShardConnFactory) stats() map[string]*redis.PoolStats {
@@ -153,13 +253,9 @@ func (factory *ShardConnFactory) doMultiKeys(fn multiKeyFn, keys ...string) []re
 	var wg sync.WaitGroup
 	results := make([]redis.Cmder, len(index2Keys))
 	var i int
-	for _, keyList := range index2Keys {
+	for ind, keyList := range index2Keys {
 		wg.Add(1)
-		go func(keyList []string, i int) {
-			result := fn(factory, keyList...)
-			results[i] = result
-			wg.Done()
-		}(keyList, i)
+		factory.runTask(ind, multiKeyTask{fn: fn, keys: keyList, results: results, i: i, wg: &wg})
 		i++
 	}
 	wg.Wait()

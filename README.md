@@ -107,6 +107,22 @@ pool.Set(ctx, "foo", "bar", 0)
 
 Shard pool use the `CRC32` as default hash function when sharding the key, you can overwrite the `HashFn` in config if wants to use other sharding hash function. The distribution type supports `ketama` and `modular`, default is modular.
 
+##### Reuse Goroutines For Multi-Key Commands
+
+Multi-key commands (`MGet`, `Del`, `Exists`, ...) are split by shards, and by default every part runs in a new goroutine. A new goroutine starts with a small stack. When the command goes through a deep call chain, such as several hooks and a TLS connection, the runtime grows the stack and copies it on every command, which costs noticeable CPU with many shards.
+
+`MultiKeyWorkers` makes the pool run these parts in long-lived worker goroutines whose stacks are grown once and reused:
+
+```go
+pool, err := pool.NewShard(&pool.ShardConfig{
+    Shards: shards,
+    MultiKeyWorkers: 1024,                       // upper limit, workers are started on demand
+    MultiKeyWorkerIdleTimeout: 10 * time.Second, // idle workers exit after this timeout (default)
+})
+```
+
+The workers help when multi-key commands span many shards and the call chain under them is deep: hooks for metrics or tracing, TLS. With shallow stacks the handover to a worker can cost more than a new goroutine, so the option is disabled by default. Measure with your workload: `runtime.newstack` and `runtime.copystack` in a CPU profile show the cost of stack growth.
+
 ## Test
 
 ```shell

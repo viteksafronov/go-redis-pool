@@ -1,3 +1,7 @@
+## Unreleased
+
+- Add ShardConfig.MultiKeyWorkers to run per-shard parts of multi-key commands in reusable worker goroutines
+
 ## v3.3.2 (2025-14-04)
 
 - Add GetMasterShards method
