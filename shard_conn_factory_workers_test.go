@@ -118,15 +118,52 @@ func TestDoMultiKeysWorkersExitWhenIdle(t *testing.T) {
 	checkResults(t, factory, testKeys(100))
 }
 
+// After a burst, a steady low load must keep only the workers it needs: the
+// rest stay idle at the bottom of the stack and exit by timeout.
+func TestDoMultiKeysWorkersShrinkAfterBurst(t *testing.T) {
+	const shards = 16
+	factory := newWorkersFactory(shards, 1024, 100*time.Millisecond)
+	keys := testKeys(100)
+
+	slowFn := func(f *ShardConnFactory, keyList ...string) redis.Cmder {
+		time.Sleep(time.Millisecond)
+		return echoFn(f, keyList...)
+	}
+	var wg sync.WaitGroup
+	for g := 0; g < 32; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 10; i++ {
+				factory.doMultiKeys(slowFn, keys...)
+			}
+		}()
+	}
+	wg.Wait()
+	burst := factory.workers.Load()
+	if burst <= 2*shards {
+		t.Fatalf("the burst started only %d workers", burst)
+	}
+
+	// One command at a time needs at most one worker per shard.
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		checkResults(t, factory, keys)
+	}
+	if n := factory.workers.Load(); n > shards {
+		t.Fatalf("%d workers are running after the burst (%d), want at most %d", n, burst, shards)
+	}
+}
+
 func TestMultiKeyWorkersConfig(t *testing.T) {
 	for _, workers := range []int{0, -1} {
-		if f := newWorkersFactory(16, workers, 0); f.tasks != nil {
+		if f := newWorkersFactory(16, workers, 0); f.idle != nil {
 			t.Fatalf("workers=%d must disable the workers", workers)
 		}
 	}
 
 	f := newWorkersFactory(16, 4, 0)
-	if f.tasks == nil {
+	if f.idle == nil {
 		t.Fatal("workers=4 must enable the workers")
 	}
 	if f.cfg.MultiKeyWorkerIdleTimeout != DefaultMultiKeyWorkerIdleTimeout {

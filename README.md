@@ -111,7 +111,7 @@ Shard pool use the `CRC32` as default hash function when sharding the key, you c
 
 Multi-key commands (`MGet`, `Del`, `Exists`, ...) are split by shards, and by default every part runs in a new goroutine. A new goroutine starts with a small stack. When the command goes through a deep call chain, such as several hooks and a TLS connection, the runtime grows the stack and copies it on every command, which costs noticeable CPU with many shards.
 
-`MultiKeyWorkers` makes the pool run these parts in long-lived worker goroutines whose stacks are grown once and reused:
+`MultiKeyWorkers` makes the pool run these parts in long-lived worker goroutines whose stacks are grown once and reused. A task goes to the most recently freed worker of its shard, so a small set of workers with grown stacks does the work, and the extra workers started by a load spike exit after the idle timeout:
 
 ```go
 pool, err := pool.NewShard(&pool.ShardConfig{

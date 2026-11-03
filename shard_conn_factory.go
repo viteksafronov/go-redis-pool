@@ -50,8 +50,60 @@ type ShardConnFactory struct {
 	shards []*HAConnFactory
 	hash   hashkit.HashKit
 
-	tasks   []chan multiKeyTask // per shard
+	idle    []idleWorkers // per shard
 	workers atomic.Int32
+}
+
+// idleWorkers is a LIFO stack of the idle workers of a shard. A task goes to
+// the most recently freed worker, so a small set of workers with grown stacks
+// does all the work. Workers at the bottom stay idle and exit by timeout. With
+// a FIFO queue tasks would rotate over all workers: none of them would reach
+// the idle timeout, and the GC would shrink their stacks between tasks.
+type idleWorkers struct {
+	mu      sync.Mutex
+	workers []*multiKeyWorker
+}
+
+type multiKeyWorker struct {
+	tasks chan multiKeyTask // buffered: a sender never waits for the worker
+}
+
+// pop takes the most recently freed worker.
+func (s *idleWorkers) pop() *multiKeyWorker {
+	s.mu.Lock()
+	n := len(s.workers)
+	if n == 0 {
+		s.mu.Unlock()
+		return nil
+	}
+	w := s.workers[n-1]
+	s.workers[n-1] = nil
+	s.workers = s.workers[:n-1]
+	s.mu.Unlock()
+	return w
+}
+
+func (s *idleWorkers) push(w *multiKeyWorker) {
+	s.mu.Lock()
+	s.workers = append(s.workers, w)
+	s.mu.Unlock()
+}
+
+// remove takes w out of the stack. It returns false if w has already been
+// popped, then a task is being sent to it.
+func (s *idleWorkers) remove(w *multiKeyWorker) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	// Workers that exit by timeout are at the bottom of the stack.
+	for i, v := range s.workers {
+		if v == w {
+			copy(s.workers[i:], s.workers[i+1:])
+			s.workers[len(s.workers)-1] = nil
+			s.workers = s.workers[:len(s.workers)-1]
+			return true
+		}
+	}
+	return false
 }
 
 // multiKeyTask is a per-shard part of a multi-key command.
@@ -107,60 +159,69 @@ func (factory *ShardConnFactory) startWorkers() {
 	if factory.cfg.MultiKeyWorkerIdleTimeout <= 0 {
 		factory.cfg.MultiKeyWorkerIdleTimeout = DefaultMultiKeyWorkerIdleTimeout
 	}
-	// A channel per shard spreads contention between concurrent commands.
-	// Channels are unbuffered: a task is handed over only to an idle worker.
-	factory.tasks = make([]chan multiKeyTask, len(factory.shards))
-	for i := range factory.tasks {
-		factory.tasks[i] = make(chan multiKeyTask)
-	}
+	// A stack per shard spreads contention between concurrent commands.
+	factory.idle = make([]idleWorkers, len(factory.shards))
 }
 
 // runTask hands the task over to an idle worker, starts a new worker if the
 // limit allows, or falls back to a one-off goroutine.
 func (factory *ShardConnFactory) runTask(ind uint32, task multiKeyTask) {
-	if factory.tasks == nil {
+	if factory.idle == nil {
 		go task.run(factory)
 		return
 	}
-	tasks := factory.tasks[ind]
-	select {
-	case tasks <- task:
+	idle := &factory.idle[ind]
+	if w := idle.pop(); w != nil {
+		w.tasks <- task
 		return
-	default:
 	}
 	if factory.workers.Add(1) <= int32(factory.cfg.MultiKeyWorkers) {
-		go factory.worker(tasks, task)
+		go factory.worker(idle, task)
 		return
 	}
 	factory.workers.Add(-1)
 	go task.run(factory)
 }
 
-func (factory *ShardConnFactory) worker(tasks chan multiKeyTask, task multiKeyTask) {
+func (factory *ShardConnFactory) worker(idle *idleWorkers, task multiKeyTask) {
 	defer factory.workers.Add(-1)
 
-	task.run(factory)
+	w := &multiKeyWorker{tasks: make(chan multiKeyTask, 1)}
+	w.run(factory, idle, task)
 
-	idle := factory.cfg.MultiKeyWorkerIdleTimeout
-	timer := time.NewTimer(idle)
+	timeout := factory.cfg.MultiKeyWorkerIdleTimeout
+	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 	for {
 		select {
-		case task := <-tasks:
-			task.run(factory)
+		case task := <-w.tasks:
 			if !timer.Stop() {
 				select {
 				case <-timer.C:
 				default:
 				}
 			}
-			timer.Reset(idle)
+			w.run(factory, idle, task)
 		case <-timer.C:
-			// Workers have no stop channel: a select on a channel shared by all
-			// workers would contend on its lock. After close they exit by timeout.
-			return
+			// Workers have no stop channel: they exit by timeout, also after
+			// the pool is closed.
+			if idle.remove(w) {
+				return
+			}
+			// The worker has just been popped, a task is on its way.
+			w.run(factory, idle, <-w.tasks)
 		}
+		timer.Reset(timeout)
 	}
+}
+
+// run executes the task and puts the worker back to the stack before the
+// command is told that the part is done. So the next command of a caller finds
+// the worker idle and does not start a new one.
+func (w *multiKeyWorker) run(factory *ShardConnFactory, idle *idleWorkers, task multiKeyTask) {
+	task.results[task.i] = task.fn(factory, task.keys...)
+	idle.push(w)
+	task.wg.Done()
 }
 
 func (factory *ShardConnFactory) stats() map[string]*redis.PoolStats {
